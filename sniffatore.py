@@ -1,12 +1,18 @@
 import time
 from socket import AF_PACKET, SOCK_RAW, SO_RCVBUF, SOL_SOCKET, ntohs, inet_ntoa, socket
 import netifaces as ni
+import logging
 import struct
 from ctypes import *
 import argparse
 
 import threading
 import queue
+
+
+logger = logging.getLogger('sniffer')
+logging.basicConfig(format='%(asctime)s %(message)s', filename='/var/log/sniffer.log', encoding='utf-8', level=logging.DEBUG)
+
 
 
 #class that represents the TCP header and maps raw bytes (from socket) to the corresponding TCP header fields
@@ -162,14 +168,19 @@ class Sniffer:
         self.downtime_scanners = {}
 
 
+        
+
+
     #Method executed by a second thread that reads data from a blocking queue and keeps track of potential scanners
     def _analyze_packets(self):
 
-        print("Starting analyzer")
+
+        logger.debug('starting analyzer')
+        #print("Starting analyzer")
 
         #use these timers to remove useless entries from dictionaries every 10 minutes
         current_time = time.time()
-        cleanup_time = current_time + 600
+        cleanup_time = current_time + 60
         
 
         while True:
@@ -182,7 +193,7 @@ class Sniffer:
             if(current_time >= cleanup_time):
                 self._cleanup_routine()
                 current_time = time.time()
-                cleanup_time = current_time + 600
+                cleanup_time = current_time + 60
 
 
             #(ip_src, src_port, dst_port)
@@ -199,7 +210,6 @@ class Sniffer:
 
                 #time window expired, remove ip from dictionary
                 if(scanner.get_remaining_time() < 0):
-                    #print("scanner: " + scanner.get_ip() + " window expired")
                     del(self.scanners_dict[item[0]])
 
 
@@ -209,7 +219,6 @@ class Sniffer:
                     #a new port has been scanned
                     if(dst_port not in scanner.get_ports()):
 
-                        #print("new port " + str(dst_port) + ", " + "scanned by ip: " + scanner.get_ip())
                         scanner.add_port(dst_port)
 
                         #did the 'attacker' scan more than THRESHOLD ports? If so alert
@@ -232,23 +241,25 @@ class Sniffer:
 
 
                 #new IP address to monitor, create a new scanner object and add the port that it has just scanned
-                #print("new scanner: " + item[0] + ", port : " + str(item[2]))
                 self.scanners_dict[item[0]] = Scanner(item[0])
                 self.scanners_dict[item[0]].add_port(item[2])
 
             
-        print("Analyzer exiting")
+        logger.debug("analyzer exiting")
         self.queue.task_done()
 
 
     def _alert(self, ip_src):
-        print("inbound scan by ip: " + ip_src)
+
+        temp_string = "inbound scan by ip: " + ip_src
+        logger.info(temp_string)
+        print(temp_string)
 
         #don't need to keep track of it after the alert's been triggered
         del(self.scanners_dict[ip_src])
 
         #add a downtime to avoid being flooded with alerts within the same nmap scan
-        self.downtime_scanners[ip_src] = time.time() + 600
+        self.downtime_scanners[ip_src] = time.time() + 10
 
 
 
@@ -290,11 +301,9 @@ class Sniffer:
             return (False, -1, -1)
 
         if(tcp_hdr.syn is False):
-            print("not a syn")
             return (False, -1, -1)
 
 
-        #print("Got a SYN, src_port: " + str(tcp_hdr.src_port) + ", dest_port: " + str(tcp_hdr.dst_port))
         return (True, tcp_hdr.src_port, tcp_hdr.dst_port)
 
 
@@ -303,6 +312,8 @@ class Sniffer:
         self.sniffer = socket(AF_PACKET, SOCK_RAW, ntohs(0x0003))
 
         self._bind_interface()
+
+        logger.info('sniffer has started')
 
         try:
             while True:
@@ -332,7 +343,6 @@ class Sniffer:
                 #check if the dst mac address corresponds to that of the interface we are monitoring
 
                 if(list(eth_header[0:6]) != self.interface_mac_addr):
-                    #print("mac !=")
                     continue
 
                 
@@ -342,13 +352,11 @@ class Sniffer:
                 is_ip_tcp, payload, ip_src = self._filter_IP(raw_buffer[14:])
 
                 if(is_ip_tcp is False or payload == 0):
-                    #print("failed ip filter")
                     continue
 
                 
                 tcp_filter_res, src_port, dst_port = self._filter_TCP(payload)
                 if(tcp_filter_res is False):
-                    #print("failed tcp filter")
                     continue
 
                 self.queue.put((ip_src, src_port, dst_port))
@@ -358,8 +366,8 @@ class Sniffer:
 
         # handle CTRL+C
         except KeyboardInterrupt:
-
-            print("main exiting")
+            logger.info('main exiting')
+            #print("main exiting")
             self.sniffer.close()
             self.queue.put(("exit", 0, 0))
 
@@ -367,9 +375,15 @@ class Sniffer:
     
     def _cleanup_routine(self):
         
-        #print("elements in dict before clean up: " + str(len(self.scanners_dict))) 
-        #print("elements in downtime before clean up: " + str(len(self.downtime_scanners))) 
-        
+
+        logger.debug('analyzer thread entering cleanup routine')
+        dict_elems = len(self.scanners_dict)
+        downtime_elems = len(self.downtime_scanners)
+
+        logger.debug('elems in dict: ' + str(dict_elems)) 
+        logger.debug('elems in downtime: ' + str(downtime_elems))
+
+
         #first cleanup scanner dict
         self.scanners_dict = {k: v for k,v in self.scanners_dict.items() if v.get_remaining_time() > 0}
 
@@ -379,18 +393,23 @@ class Sniffer:
         #print("elements in dict after clean up: " + str(len(self.scanners_dict))) 
         #print("elements in downtime after clean up: " + str(len(self.downtime_scanners))) 
 
+        logger.debug('just removed ' + str(dict_elems - len(self.scanners_dict)) + 'from dict and ' + str(downtime_elems - len(self.downtime_scanners)) + ' from downtime')
+        logger.debug('analyzer thread exiting cleanup routine')
 
 
-interface = "eth0"
-parser = argparse.ArgumentParser(description="detect port scans by monitoring an interface")
-parser.add_argument('-i', '--interface', type=str, help='specify interface to capture from')
+
+if __name__ == '__main__':
 
 
-args = parser.parse_args()
-if(args.interface is not None):
-    interface = args.interface
+    interface = "eth0"
+    parser = argparse.ArgumentParser(description="detect port scans by monitoring an interface")
+    parser.add_argument('-i', '--interface', type=str, help='specify interface to capture from')
 
 
-sniffer = Sniffer(interface)
-sniffer.start()
+    args = parser.parse_args()
+    if(args.interface is not None):
+        interface = args.interface
+
+    sniffer = Sniffer(interface)
+    sniffer.start()
 
